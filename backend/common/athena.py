@@ -4,26 +4,34 @@ Provides reusable utilities for executing, polling, and formatting Athena SQL qu
 against the Glue Data Catalog data lake with timeout safeguards and error handling.
 """
 
-import time
+import logging
 import os
+import time
+
 import boto3
 
 athena_client = boto3.client("athena")
+logger = logging.getLogger(__name__)
 
 PROCESSED_BUCKET = os.environ.get("PROCESSED_BUCKET")
 DATABASE_NAME = os.environ.get("DATABASE_NAME", "campusvoice_db_dev")
 WORKGROUP_NAME = os.environ.get("ATHENA_WORKGROUP", "primary")
 
 
-def execute_athena_query(query: str, database: str = None, workgroup: str = None, timeout_sec: int = 30) -> list[dict]:
+def execute_athena_query(
+    query: str,
+    database: str | None = None,
+    workgroup: str | None = None,
+    timeout_sec: int = 30,
+) -> list[dict]:
     """Execute Athena SQL query, poll for completion, and return results as list of dicts.
-    
+
     Args:
         query: SQL query string
         database: Glue Catalog database name
         workgroup: Athena workgroup name (enforcing byte-scan cutoff)
         timeout_sec: Maximum wait duration before timeout
-        
+
     Returns:
         List of dictionaries where keys are column names and values are typed entries.
     """
@@ -60,8 +68,8 @@ def execute_athena_query(query: str, database: str = None, workgroup: str = None
     # Cancel if timed out
     try:
         athena_client.stop_query_execution(QueryExecutionId=qid)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not stop timed out Athena query %s: %s", qid, exc)
     raise TimeoutError(f"Athena query timed out after {timeout_sec}s (QID: {qid})")
 
 
@@ -75,7 +83,7 @@ def fetch_query_results(qid: str) -> list[dict]:
     for page in paginator.paginate(QueryExecutionId=qid):
         result_set = page.get("ResultSet", {})
         metadata = result_set.get("ResultSetMetadata", {}).get("ColumnInfo", [])
-        
+
         if not headers and metadata:
             headers = [col["Name"] for col in metadata]
             types = [col.get("Type", "varchar").lower() for col in metadata]

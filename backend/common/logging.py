@@ -19,7 +19,7 @@ if not logger.handlers:
 
 def log_event(event_type: str, details: dict, level: str = "INFO"):
     """Emit a structured JSON log entry.
-    
+
     Args:
         event_type: Category of the event (e.g., 'pii_masking_complete')
         details: Dictionary of non-sensitive metrics, counts, and status
@@ -30,7 +30,7 @@ def log_event(event_type: str, details: dict, level: str = "INFO"):
         "details": details
     }
     msg = json.dumps(payload, default=str)
-    
+
     if level == "ERROR":
         logger.error(msg)
     elif level == "WARNING":

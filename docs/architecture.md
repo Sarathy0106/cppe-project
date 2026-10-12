@@ -236,22 +236,22 @@ sequenceDiagram
     Admin->>Web: Selects raw student feedback CSV
     Web->>GW: POST /upload-url (Bearer JWT)
     GW-->>Web: Returns Presigned S3 PUT URL
-    Web->>S3Raw: PUT /uploads/<batch>/feedback.csv (SSE-KMS via Data CMK)
+    Web->>S3Raw: PUT /uploads/batch-id/feedback.csv (SSE-KMS via Data CMK)
     Note over S3Raw,KMS: Encrypted at rest: alias/campusvoice-data
 
     S3Raw->>SFN: s3:ObjectCreated triggers pipeline
     SFN->>SFN: Step 1: Comprehend masks PII entities
-    SFN->>S3Proc: Writes staging/<batch>.csv (Encrypted via Data CMK)
+    SFN->>S3Proc: Writes staging/batch-id.csv (Encrypted via Data CMK)
     
     SFN->>SFN: Step 2: TF-IDF MLlib classification
     SFN->>S3Proc: Writes curated/month=YYYY-MM/*.parquet (Snappy + SSE-KMS)
     
     SFN->>SFN: Step 3: Bedrock Titan vectorization
-    SFN->>S3Proc: Writes vectors/<batch>.json (256-d vectors, SSE-KMS)
+    SFN->>S3Proc: Writes vectors/batch-id.json (256-d vectors, SSE-KMS)
     
     SFN->>KMS: Signs batch digest with alias/campusvoice-sign (RSA_2048)
     KMS-->>SFN: Returns cryptographic digital signature
-    SFN->>S3Proc: Writes manifests/<batch>.json and .sig
+    SFN->>S3Proc: Writes manifests/batch-id.json and .sig
     Note over S3Proc,KMS: Manifest integrity guaranteed by asymmetric cryptography
 
     actor Viewer as College Staff
@@ -259,5 +259,5 @@ sequenceDiagram
     Web->>GW: GET /stats?type=kpis (Bearer JWT)
     GW->>Ath: Executes canned query (100MB scan limit)
     Ath->>S3Proc: Scans Parquet partition metadata
-    Ath-->>Web: Returns aggregated JSON metrics (<50ms cached)
+    Ath-->>Web: Returns aggregated JSON metrics (sub-50ms cached)
 ```
