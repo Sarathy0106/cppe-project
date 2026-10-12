@@ -6,7 +6,6 @@ Covers:
 3. Pure-Python Vector Cosine Similarity
 """
 
-import math
 import re
 import pytest
 
