@@ -1,0 +1,1707 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CampusVoice: Secure, serverless AI and big-data student feedback platform (Wipro CPPE).
+  Phase 1 & Phase 3: Security Foundation, Athena/Glue Catalog Data Lake, Step Functions Pipeline, KMS Signatures.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Deployment stage (dev, prod)
+
+  AlertEmail:
+    Type: String
+    Default: sarathy01062005@gmail.com
+    Description: Email address for budget and security alerts
+
+  LlmModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: Amazon Bedrock LLM model ID or inference profile ARN
+
+  EmbedModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Amazon Bedrock Titan embeddings model ID
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # ============================================================================
+  # 1. KMS CRYPTOGRAPHIC KEYS
+  # ============================================================================
+
+  # Symmetric CMK for data at rest (S3, CloudWatch Logs, SNS, Athena)
+  DataKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CampusVoice symmetric CMK for S3, CloudWatch Logs, and Athena encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: campusvoice-data-key-policy
+        Statement:
+          - Sid: EnableRootAndAdminAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          - Sid: AllowCloudTrailEncryption
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+
+          - Sid: AllowCloudWatchLogsEncryption
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+          - Sid: AllowSNSEncryption
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt*
+            Resource: '*'
+
+          - Sid: AllowS3ServiceEncryption
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt*
+            Resource: '*'
+
+  DataKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/campusvoice-data
+      TargetKeyId: !Ref DataKmsKey
+
+  # Asymmetric Key for batch manifest digital signatures (RSA_2048, SIGN_VERIFY)
+  SignKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CampusVoice asymmetric key for batch manifest digital signatures
+      KeySpec: RSA_2048
+      KeyUsage: SIGN_VERIFY
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: campusvoice-sign-key-policy
+        Statement:
+          - Sid: EnableRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  SignKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/campusvoice-sign
+      TargetKeyId: !Ref SignKmsKey
+
+  # ============================================================================
+  # 2. S3 STORAGE FOUNDATION (Encrypted, Versioned, TLS-Only, Public Access Blocked)
+  # ============================================================================
+
+  # Raw bucket for admin CSV uploads
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'campusvoice-raw-${AWS::AccountId}-${Stage}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt DataKmsKey.Arn
+            BucketKeyEnabled: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt StartPipelineFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+                  - Name: suffix
+                    Value: .csv
+
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonHttpsTraffic
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${RawBucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${RawBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+          - Sid: DenyNonKmsPutObject
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${RawBucket}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+              'Null':
+                's3:x-amz-server-side-encryption': 'false'
+
+  # Processed bucket for staging, curated Parquet, vectors, manifests, and models
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'campusvoice-processed-${AWS::AccountId}-${Stage}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt DataKmsKey.Arn
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AthenaResultsRetention7Days
+            Prefix: athena-results/
+            Status: Enabled
+            ExpirationInDays: 7
+
+  ProcessedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProcessedBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonHttpsTraffic
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+          - Sid: DenyNonKmsPutObject
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+              'Null':
+                's3:x-amz-server-side-encryption': 'false'
+
+  # Logs bucket for CloudTrail and access logging
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'campusvoice-logs-${AWS::AccountId}-${Stage}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt DataKmsKey.Arn
+            BucketKeyEnabled: true
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonHttpsTraffic
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${LogsBucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${LogsBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+          - Sid: AllowCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${LogsBucket}'
+
+          - Sid: AllowCloudTrailWriteLogs
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${LogsBucket}/cloudtrail/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+
+  # Frontend private bucket (served exclusively via CloudFront in Phase 7)
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'campusvoice-frontend-${AWS::AccountId}-${Stage}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonHttpsTraffic
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${FrontendBucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${FrontendBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ============================================================================
+  # 3. AUDIT LOGGING & CLOUDTRAIL
+  # ============================================================================
+
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/campusvoice-${Stage}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt DataKmsKey.Arn
+
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CloudTrailToCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub '${CloudTrailLogGroup.Arn}:*'
+
+  # CloudTrail Trail: Management events + S3 Data events on Raw bucket
+  # Note: CloudTrail data events cost approximately $0.10 per 100k events.
+  CampusVoiceTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - LogsBucketPolicy
+    Properties:
+      TrailName: !Sub 'campusvoice-trail-${Stage}'
+      S3BucketName: !Ref LogsBucket
+      S3KeyPrefix: 'cloudtrail'
+      IsLogging: true
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      KMSKeyId: !GetAtt DataKmsKey.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values:
+                - !Sub '${RawBucket.Arn}/'
+
+  # ============================================================================
+  # 4. MONITORING & BUDGET GUARDRAILS
+  # ============================================================================
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'campusvoice-alerts-${Stage}'
+      KmsMasterKeyId: !GetAtt DataKmsKey.Arn
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # AWS Budget: $10 monthly budget with email alert at 80% ($8.00)
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'campusvoice-budget-${Stage}'
+        BudgetLimit:
+          Amount: 10
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  # Metric Filter: Detect unauthorized API calls and access denied errors in CloudTrail logs
+  AccessDeniedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CampusVoice/Security
+          MetricName: AccessDeniedCount
+          DefaultValue: 0
+
+  # Alarm: Alert on suspicious access denied attempts (>= 3 in 5 minutes)
+  AccessDeniedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'campusvoice-access-denied-${Stage}'
+      AlarmDescription: 'Fires when >= 3 unauthorized or access denied operations occur within 5 minutes'
+      MetricName: AccessDeniedCount
+      Namespace: CampusVoice/Security
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  # Alarm: Step Functions pipeline execution failure (>= 1)
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'campusvoice-pipeline-failure-${Stage}'
+      AlarmDescription: 'Fires when the Step Functions feedback processing pipeline fails'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref CampusVoiceStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  # Alarm: Pipeline Lambda microservice errors (>= 1 in 5 minutes)
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'campusvoice-lambda-errors-${Stage}'
+      AlarmDescription: 'Fires when any pipeline Lambda function incurs unhandled errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MaskPiiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Operations & Threat Detection Dashboard
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'campusvoice-ops-${Stage}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CampusVoice/Security", "AccessDeniedCount", { "stat": "Sum", "label": "Access Denied / Unauthorized Events", "color": "#d62728" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Threat Detection: Unauthorized & Access Denied Operations",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${CampusVoiceStateMachine}", { "stat": "Sum", "color": "#2ca02c" } ],
+                  [ "AWS/States", "ExecutionsFailed", "StateMachineArn", "${CampusVoiceStateMachine}", { "stat": "Sum", "color": "#d62728" } ],
+                  [ "AWS/States", "ExecutionsStarted", "StateMachineArn", "${CampusVoiceStateMachine}", { "stat": "Sum", "color": "#1f77b4" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Step Functions Pipeline Orchestration",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${MaskPiiFunction}", { "stat": "Sum" } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${CleanFeedbackFunction}", { "stat": "Sum" } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${EmbedFeedbackFunction}", { "stat": "Sum" } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${MaskPiiFunction}", { "stat": "Sum", "color": "#d62728" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Pipeline Functions Invocations & Errors",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "4xx", "ApiId", "${CampusVoiceHttpApi}", { "stat": "Sum", "color": "#ff7f0e" } ],
+                  [ "AWS/ApiGateway", "5xx", "ApiId", "${CampusVoiceHttpApi}", { "stat": "Sum", "color": "#d62728" } ],
+                  [ "AWS/ApiGateway", "Count", "ApiId", "${CampusVoiceHttpApi}", { "stat": "Sum", "color": "#1f77b4" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "HTTP API Gateway Traffic (Total, 4XX & 5XX)",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # ============================================================================
+  # 5. GLUE DATA CATALOG & ATHENA SCHEMA (Module 2)
+  # ============================================================================
+
+  CampusVoiceDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub 'campusvoice_db_${Stage}'
+        Description: 'CampusVoice Curated Feedback Catalog Database'
+
+  FeedbackParquetTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CampusVoiceDatabase
+      TableInput:
+        Name: feedback
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+        StorageDescriptor:
+          Columns:
+            - Name: feedback_id
+              Type: string
+            - Name: department
+              Type: string
+            - Name: year
+              Type: int
+            - Name: feedback_text
+              Type: string
+            - Name: feedback_date
+              Type: string
+            - Name: sentiment
+              Type: string
+            - Name: category
+              Type: string
+            - Name: category_confidence
+              Type: double
+            - Name: pii_count
+              Type: int
+            - Name: batch_id
+              Type: string
+          Location: !Sub 's3://${ProcessedBucket}/curated/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+        PartitionKeys:
+          - Name: month
+            Type: string
+
+  # Athena Dedicated Analytics WorkGroup (Enforces 100MB query scan cutoff and SSE-KMS)
+  AnalyticsWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub 'campusvoice-analytics-${Stage}'
+      Description: 'CampusVoice Analytics Workgroup with 100MB query scan cap'
+      State: ENABLED
+      WorkGroupConfiguration:
+        BytesScannedCutoffPerQuery: 104857600
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${ProcessedBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !GetAtt DataKmsKey.Arn
+
+  # ============================================================================
+  # 6. PIPELINE LAMBDA MICROSERVICES (Module 1 & 4)
+  # ============================================================================
+
+  StartPipelineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-start-pipeline-${Stage}'
+      CodeUri: backend/start_pipeline/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref CampusVoiceStateMachine
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !Sub 'campusvoice-pipeline-${Stage}'
+
+  StartPipelinePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt StartPipelineFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::campusvoice-raw-${AWS::AccountId}-${Stage}'
+
+  MaskPiiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-mask-pii-${Stage}'
+      CodeUri: backend/mask_pii/
+      Handler: app.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          KMS_KEY_ID: !GetAtt DataKmsKey.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::campusvoice-raw-${AWS::AccountId}-${Stage}/*'
+            - Effect: Allow
+              Action:
+                - 's3:PutObject'
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            - Effect: Allow
+              Action:
+                - 'comprehend:DetectPiiEntities'
+                - 'comprehend:BatchDetectSentiment'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+              Resource: !GetAtt DataKmsKey.Arn
+
+  CleanFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-clean-feedback-${Stage}'
+      CodeUri: backend/clean_feedback/
+      Handler: app.lambda_handler
+      Timeout: 180
+      MemorySize: 512
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          DATABASE_NAME: !Ref CampusVoiceDatabase
+          KMS_KEY_ID: !GetAtt DataKmsKey.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:PutObject'
+                - 's3:GetBucketLocation'
+                - 's3:ListBucket'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}'
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            - Effect: Allow
+              Action:
+                - 'athena:StartQueryExecution'
+                - 'athena:GetQueryExecution'
+                - 'athena:GetQueryResults'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'glue:GetDatabase'
+                - 'glue:GetTable'
+                - 'glue:GetPartitions'
+                - 'glue:GetPartition'
+                - 'glue:BatchCreatePartition'
+                - 'glue:CreatePartition'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+              Resource: !GetAtt DataKmsKey.Arn
+
+  StartCrawlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-start-crawler-${Stage}'
+      CodeUri: backend/start_crawler/
+      Handler: app.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          DATABASE_NAME: !Ref CampusVoiceDatabase
+          KMS_KEY_ID: !GetAtt DataKmsKey.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'athena:StartQueryExecution'
+                - 'athena:GetQueryExecution'
+                - 'athena:GetQueryResults'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:PutObject'
+                - 's3:GetBucketLocation'
+                - 's3:ListBucket'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}'
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            - Effect: Allow
+              Action:
+                - 'glue:GetDatabase'
+                - 'glue:GetTable'
+                - 'glue:GetPartitions'
+                - 'glue:BatchCreatePartition'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+              Resource: !GetAtt DataKmsKey.Arn
+
+  EmbedFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-embed-feedback-${Stage}'
+      CodeUri: backend/embed_feedback/
+      Handler: app.lambda_handler
+      Timeout: 180
+      MemorySize: 512
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          KMS_KEY_ID: !GetAtt DataKmsKey.Arn
+          EMBED_MODEL_ID: !Ref EmbedModelId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/staging/*'
+            - Effect: Allow
+              Action:
+                - 's3:PutObject'
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/vectors/*'
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+              Resource: !GetAtt DataKmsKey.Arn
+            - Effect: Allow
+              Action:
+                - 'bedrock:InvokeModel'
+              Resource: '*'
+
+  SignManifestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-sign-manifest-${Stage}'
+      CodeUri: backend/sign_manifest/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          SIGN_KEY_ID: !GetAtt SignKmsKey.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 's3:PutObject'
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/manifests/*'
+            - Effect: Allow
+              Action:
+                - 'kms:Sign'
+              Resource: !GetAtt SignKmsKey.Arn
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+              Resource: !GetAtt DataKmsKey.Arn
+
+  # ============================================================================
+  # 7. STEP FUNCTIONS PIPELINE ORCHESTRATION (Module 1)
+  # ============================================================================
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/campusvoice-pipeline-${Stage}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt DataKmsKey.Arn
+
+  CampusVoiceStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub 'campusvoice-pipeline-${Stage}'
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: false
+        Level: ERROR
+      DefinitionSubstitutions:
+        MaskPiiFunctionArn: !GetAtt MaskPiiFunction.Arn
+        CleanFeedbackFunctionArn: !GetAtt CleanFeedbackFunction.Arn
+        StartCrawlerFunctionArn: !GetAtt StartCrawlerFunction.Arn
+        EmbedFeedbackFunctionArn: !GetAtt EmbedFeedbackFunction.Arn
+        SignManifestFunctionArn: !GetAtt SignManifestFunction.Arn
+      Definition:
+        StartAt: MaskPII
+        States:
+          MaskPII:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${MaskPiiFunctionArn}
+              Payload:
+                bucket.$: "$.bucket"
+                key.$: "$.key"
+                batch_id.$: "$.batch_id"
+            ResultSelector:
+              batch_id.$: "$.Payload.batch_id"
+              staging_path.$: "$.Payload.staging_path"
+              record_count.$: "$.Payload.record_count"
+              pii_count.$: "$.Payload.pii_count"
+            ResultPath: "$.mask_result"
+            Retry:
+              - ErrorEquals:
+                  - States.TaskFailed
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: "$.error"
+                Next: PipelineFailed
+            Next: CleanFeedback
+
+          CleanFeedback:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${CleanFeedbackFunctionArn}
+              Payload:
+                batch_id.$: "$.batch_id"
+                staging_path.$: "$.mask_result.staging_path"
+                record_count.$: "$.mask_result.record_count"
+            ResultSelector:
+              batch_id.$: "$.Payload.batch_id"
+              record_count.$: "$.Payload.record_count"
+              curated_prefix.$: "$.Payload.curated_prefix"
+              jsonl_path.$: "$.Payload.jsonl_path"
+            ResultPath: "$.clean_result"
+            Retry:
+              - ErrorEquals:
+                  - States.TaskFailed
+                  - Lambda.ServiceException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: "$.error"
+                Next: PipelineFailed
+            Next: StartCrawler
+
+          StartCrawler:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${StartCrawlerFunctionArn}
+              Payload:
+                batch_id.$: "$.batch_id"
+            ResultPath: "$.crawler_result"
+            Retry:
+              - ErrorEquals:
+                  - States.TaskFailed
+                  - Lambda.ServiceException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: "$.error"
+                Next: PipelineFailed
+            Next: EmbedFeedback
+
+          EmbedFeedback:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${EmbedFeedbackFunctionArn}
+              Payload:
+                batch_id.$: "$.batch_id"
+                record_count.$: "$.clean_result.record_count"
+            ResultSelector:
+              batch_id.$: "$.Payload.batch_id"
+              vector_count.$: "$.Payload.vector_count"
+              vector_path.$: "$.Payload.vector_path"
+            ResultPath: "$.embed_result"
+            Retry:
+              - ErrorEquals:
+                  - States.TaskFailed
+                  - Lambda.ServiceException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: "$.error"
+                Next: PipelineFailed
+            Next: SignManifest
+
+          SignManifest:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${SignManifestFunctionArn}
+              Payload:
+                batch_id.$: "$.batch_id"
+                record_count.$: "$.clean_result.record_count"
+            ResultPath: "$.sign_result"
+            Retry:
+              - ErrorEquals:
+                  - States.TaskFailed
+                  - Lambda.ServiceException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: "$.error"
+                Next: PipelineFailed
+            Next: PipelineSuccess
+
+          PipelineSuccess:
+            Type: Succeed
+
+          PipelineFailed:
+            Type: Fail
+            Error: "PipelineExecutionFailed"
+            Cause: "CampusVoice data pipeline encountered an unrecoverable failure."
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref MaskPiiFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CleanFeedbackFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref StartCrawlerFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref EmbedFeedbackFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SignManifestFunction
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'logs:CreateLogDelivery'
+                - 'logs:CreateLogStream'
+                - 'logs:GetLogDelivery'
+                - 'logs:UpdateLogDelivery'
+                - 'logs:DeleteLogDelivery'
+                - 'logs:ListLogDeliveries'
+                - 'logs:PutLogEvents'
+                - 'logs:PutResourcePolicy'
+                - 'logs:DescribeResourcePolicies'
+                - 'logs:DescribeLogGroups'
+              Resource: '*'
+
+  # ============================================================================
+  # 8. COGNITO AUTHENTICATION & RBAC (Module 4)
+  # ============================================================================
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'campusvoice-users-${Stage}'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+
+  CognitoAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admin
+      Description: CampusVoice Administrator Group with upload and pipeline permissions
+      UserPoolId: !Ref CognitoUserPool
+      Precedence: 1
+
+  CognitoViewerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Viewer
+      Description: CampusVoice Read-Only Viewer Group
+      UserPoolId: !Ref CognitoUserPool
+      Precedence: 2
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'campusvoice-web-client-${Stage}'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # ============================================================================
+  # 9. HTTP API GATEWAY & MICROSERVICES (Module 1, 2, 3 & 4)
+  # ============================================================================
+
+  CampusVoiceHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: !Sub 'campusvoice-api-${Stage}'
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Requested-With
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: '$request.header.Authorization'
+            JwtConfiguration:
+              Audience:
+                - !Ref CognitoUserPoolClient
+              Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}'
+
+  ApiStatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-api-stats-${Stage}'
+      CodeUri: backend/api_stats/
+      Handler: app.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DATABASE_NAME: !Ref CampusVoiceDatabase
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          ATHENA_WORKGROUP: !Ref AnalyticsWorkGroup
+          KMS_KEY_ID: !GetAtt DataKmsKey.Arn
+      Events:
+        GetStats:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusVoiceHttpApi
+            Path: /stats
+            Method: GET
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'athena:StartQueryExecution'
+                - 'athena:GetQueryExecution'
+                - 'athena:GetQueryResults'
+                - 'athena:StopQueryExecution'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'glue:GetDatabase'
+                - 'glue:GetTable'
+                - 'glue:GetPartitions'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:PutObject'
+                - 's3:GetBucketLocation'
+                - 's3:ListBucket'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}'
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+              Resource: !GetAtt DataKmsKey.Arn
+
+  ApiFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-api-feedback-${Stage}'
+      CodeUri: backend/api_feedback/
+      Handler: app.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DATABASE_NAME: !Ref CampusVoiceDatabase
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          ATHENA_WORKGROUP: !Ref AnalyticsWorkGroup
+          KMS_KEY_ID: !GetAtt DataKmsKey.Arn
+      Events:
+        GetFeedback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusVoiceHttpApi
+            Path: /feedback
+            Method: GET
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'athena:StartQueryExecution'
+                - 'athena:GetQueryExecution'
+                - 'athena:GetQueryResults'
+                - 'athena:StopQueryExecution'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'glue:GetDatabase'
+                - 'glue:GetTable'
+                - 'glue:GetPartitions'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:PutObject'
+                - 's3:GetBucketLocation'
+                - 's3:ListBucket'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}'
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+              Resource: !GetAtt DataKmsKey.Arn
+
+  ApiChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-api-chat-${Stage}'
+      CodeUri: backend/api_chat/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          LLM_MODEL_ID: !Ref LlmModelId
+          EMBED_MODEL_ID: !Ref EmbedModelId
+          KMS_KEY_ID: !GetAtt DataKmsKey.Arn
+      Events:
+        PostChat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusVoiceHttpApi
+            Path: /chat
+            Method: POST
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:ListBucket'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}'
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+              Resource: !GetAtt DataKmsKey.Arn
+            - Effect: Allow
+              Action:
+                - 'bedrock:InvokeModel'
+              Resource: '*'
+
+  ApiAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-api-agent-${Stage}'
+      CodeUri: backend/api_agent/
+      Handler: app.lambda_handler
+      Timeout: 90
+      MemorySize: 512
+      Environment:
+        Variables:
+          DATABASE_NAME: !Ref CampusVoiceDatabase
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          ATHENA_WORKGROUP: !Ref AnalyticsWorkGroup
+          LLM_MODEL_ID: !Ref LlmModelId
+          EMBED_MODEL_ID: !Ref EmbedModelId
+          KMS_KEY_ID: !GetAtt DataKmsKey.Arn
+      Events:
+        PostAgent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusVoiceHttpApi
+            Path: /agent
+            Method: POST
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'athena:StartQueryExecution'
+                - 'athena:GetQueryExecution'
+                - 'athena:GetQueryResults'
+                - 'athena:StopQueryExecution'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'glue:GetDatabase'
+                - 'glue:GetTable'
+                - 'glue:GetPartitions'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:PutObject'
+                - 's3:GetBucketLocation'
+                - 's3:ListBucket'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}'
+                - !Sub 'arn:${AWS::Partition}:s3:::${ProcessedBucket}/*'
+            - Effect: Allow
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+              Resource: !GetAtt DataKmsKey.Arn
+            - Effect: Allow
+              Action:
+                - 'bedrock:InvokeModel'
+              Resource: '*'
+
+  ApiUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-api-upload-url-${Stage}'
+      CodeUri: backend/api_upload_url/
+      Handler: app.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucket
+      Events:
+        PostUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusVoiceHttpApi
+            Path: /upload-url
+            Method: POST
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 's3:PutObject'
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${RawBucket}/uploads/*'
+            - Effect: Allow
+              Action:
+                - 'kms:GenerateDataKey*'
+                - 'kms:Decrypt'
+              Resource: !GetAtt DataKmsKey.Arn
+
+  ApiPipelineStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'campusvoice-api-pipeline-status-${Stage}'
+      CodeUri: backend/api_pipeline_status/
+      Handler: app.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref CampusVoiceStateMachine
+      Events:
+        GetPipelineStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusVoiceHttpApi
+            Path: /pipeline-status
+            Method: GET
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'states:ListExecutions'
+                - 'states:DescribeExecution'
+              Resource: !Ref CampusVoiceStateMachine
+
+  # ============================================================================
+  # 10. GITHUB ACTIONS OIDC & CI/CD DEPLOY ROLE (Module 1)
+  # ============================================================================
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c5876126b3040e277a7f31a52fe9e73ca1a6630
+
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'campusvoice-github-actions-${Stage}'
+      Description: IAM role assumed by GitHub Actions CI/CD via OpenID Connect (OIDC)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com'
+              StringLike:
+                'token.actions.githubusercontent.com:sub': 'repo:Sarathy0106/cppe-project:*'
+      Policies:
+        - PolicyName: CampusVoiceDeploymentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:*'
+                  - 's3:*'
+                  - 'lambda:*'
+                  - 'apigateway:*'
+                  - 'states:*'
+                  - 'iam:*'
+                  - 'logs:*'
+                  - 'glue:*'
+                  - 'athena:*'
+                  - 'kms:*'
+                  - 'cognito-idp:*'
+                  - 'budgets:*'
+                  - 'sns:*'
+                  - 'cloudwatch:*'
+                  - 'cloudtrail:*'
+                  - 'ec2:*'
+                Resource: '*'
+
+  # ============================================================================
+  # 11. VPC NETWORK BASELINE & S3 GATEWAY ENDPOINT (Module 4)
+  # Zero-cost architecture: Gateway Endpoint instead of NAT Gateway / Interface Endpoints
+  # ============================================================================
+
+  CampusVoiceVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-vpc-${Stage}'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-igw-${Stage}'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref CampusVoiceVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CampusVoiceVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-public-1-${Stage}'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CampusVoiceVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-public-2-${Stage}'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CampusVoiceVpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-private-1-${Stage}'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CampusVoiceVpc
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-private-2-${Stage}'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CampusVoiceVpc
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-public-rt-${Stage}'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  RouteTableAssocPublic1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  RouteTableAssocPublic2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CampusVoiceVpc
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-private-rt-${Stage}'
+
+  RouteTableAssocPrivate1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  RouteTableAssocPrivate2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Free S3 Gateway VPC Endpoint for private data lake routing
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref CampusVoiceVpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  # Default-Deny Security Group
+  DefaultDenySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Default-deny security group with zero ingress rules
+      VpcId: !Ref CampusVoiceVpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-deny-sg-${Stage}'
+
+  # Self-referencing Security Group for Glue multi-worker cluster communications
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Self-referencing security group for Glue ETL workers
+      VpcId: !Ref CampusVoiceVpc
+      Tags:
+        - Key: Name
+          Value: !Sub 'campusvoice-glue-sg-${Stage}'
+
+  GlueSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GlueSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref GlueSecurityGroup
+
+Outputs:
+  Stage:
+    Description: Deployment stage
+    Value: !Ref Stage
+
+  DataKmsKeyArn:
+    Description: Symmetric CMK ARN for data encryption
+    Value: !GetAtt DataKmsKey.Arn
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-DataKmsKeyArn'
+
+  SignKmsKeyArn:
+    Description: Asymmetric KMS Key ARN for manifest signatures
+    Value: !GetAtt SignKmsKey.Arn
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-SignKmsKeyArn'
+
+  RawBucketName:
+    Description: Raw S3 upload bucket
+    Value: !Ref RawBucket
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-RawBucketName'
+
+  ProcessedBucketName:
+    Description: Processed S3 curated bucket
+    Value: !Ref ProcessedBucket
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-ProcessedBucketName'
+
+  LogsBucketName:
+    Description: CloudTrail and S3 logs bucket
+    Value: !Ref LogsBucket
+
+  FrontendBucketName:
+    Description: S3 bucket for frontend hosting
+    Value: !Ref FrontendBucket
+
+  AlertsTopicArn:
+    Description: SNS topic ARN for security and budget alerts
+    Value: !Ref AlertsTopic
+
+  StateMachineArn:
+    Description: Step Functions pipeline state machine ARN
+    Value: !Ref CampusVoiceStateMachine
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-StateMachineArn'
+
+  GlueDatabaseName:
+    Description: Glue Catalog database for curated data
+    Value: !Ref CampusVoiceDatabase
+
+  FeedbackTableName:
+    Description: Glue Catalog Parquet table for curated data
+    Value: !Ref FeedbackParquetTable
+
+  HttpApiUrl:
+    Description: HTTP API Gateway endpoint URL
+    Value: !Sub 'https://${CampusVoiceHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-HttpApiUrl'
+
+  AnalyticsWorkGroupName:
+    Description: Athena Analytics Workgroup with 100MB cutoff
+    Value: !Ref AnalyticsWorkGroup
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-UserPoolClientId'
+
+  GitHubDeployRoleArn:
+    Description: IAM Role ARN for GitHub Actions CI/CD deployment
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-GitHubDeployRoleArn'
+
+  VpcId:
+    Description: CampusVoice VPC ID
+    Value: !Ref CampusVoiceVpc
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-VpcId'
+
+  S3GatewayEndpointId:
+    Description: Free S3 Gateway VPC Endpoint ID
+    Value: !Ref S3GatewayEndpoint
+    Export:
+      Name: !Sub 'campusvoice-${Stage}-S3GatewayEndpointId'
+
+
+

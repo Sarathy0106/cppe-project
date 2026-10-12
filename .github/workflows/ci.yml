@@ -1,0 +1,148 @@
+name: CampusVoice CI/CD Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STAGE: dev
+
+jobs:
+  # ============================================================================
+  # 1. BACKEND CHECKS (Lint & Pytest)
+  # ============================================================================
+  backend-checks:
+    name: Backend Checks (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest ruff boto3
+
+      - name: Code Quality & Linting
+        run: |
+          ruff check tests/ backend/common/
+
+      - name: Run Unit Tests (PII Masking, Allow-lists, Cosine Similarity)
+        run: |
+          python -m pytest tests/test_backend.py -v
+
+  # ============================================================================
+  # 2. FRONTEND CHECKS (Node 20, TypeScript & Vite Build)
+  # ============================================================================
+  frontend-checks:
+    name: Frontend Checks (Vue 3 / Vite)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Frontend Dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Compile & Build Production Bundle
+        working-directory: ./frontend
+        run: npm run build
+
+  # ============================================================================
+  # 3. AUTOMATED DEPLOYMENT (Main branch only via GitHub OIDC)
+  # ============================================================================
+  deploy:
+    name: Continuous Deployment (AWS OIDC)
+    needs: [backend-checks, frontend-checks]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 & AWS CLI
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Configure AWS Credentials via GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || 'arn:aws:iam::657878533694:role/campusvoice-github-actions-dev' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package & Deploy CloudFormation Stack
+        run: |
+          STACK_NAME="campusvoice-${STAGE}"
+          S3_BUCKET="aws-sam-cli-managed-default-samclisourcebucket-nx6o74yglnwl"
+          
+          aws cloudformation package \
+            --template-file template.yaml \
+            --s3-bucket "$S3_BUCKET" \
+            --s3-prefix campusvoice \
+            --output-template-file packaged.yaml
+
+          aws cloudformation deploy \
+            --template-file packaged.yaml \
+            --stack-name "$STACK_NAME" \
+            --s3-bucket "$S3_BUCKET" \
+            --s3-prefix campusvoice \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+            --parameter-overrides Stage="$STAGE" AlertEmail="sarathy01062005@gmail.com" \
+            --no-fail-on-empty-changeset
+
+      - name: Build & Sync Frontend to S3
+        run: |
+          STACK_NAME="campusvoice-${STAGE}"
+          FRONTEND_BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" --output text)
+          API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='HttpApiUrl'].OutputValue" --output text)
+          USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+          CLIENT_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+
+          cd frontend
+          cat <<EOF > public/config.json
+          {
+            "apiUrl": "${API_URL}",
+            "userPoolId": "${USER_POOL_ID}",
+            "clientId": "${CLIENT_ID}",
+            "region": "${AWS_REGION}"
+          }
+          EOF
+
+          npm ci
+          npm run build
+          aws s3 sync dist/ "s3://${FRONTEND_BUCKET}" --delete
+
+      - name: Deployment Success Notification
+        run: |
+          echo "=========================================================="
+          echo " CampusVoice: Production CI/CD Deployment Succeeded!"
+          echo " Stage: ${STAGE}"
+          echo " Region: ${AWS_REGION}"
+          echo "=========================================================="

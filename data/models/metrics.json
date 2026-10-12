@@ -1,0 +1,110 @@
+{
+  "evaluation_summary": {
+    "primary_model": "Logistic Regression (TF-IDF)",
+    "comparison_model": "Multinomial Naive Bayes (TF-IDF)",
+    "train_samples": 480,
+    "test_samples": 120,
+    "categories": [
+      "ADMIN",
+      "CANTEEN",
+      "FACULTY",
+      "HOSTEL",
+      "INFRASTRUCTURE",
+      "LABS",
+      "OTHER"
+    ]
+  },
+  "model_comparison": [
+    {
+      "algorithm": "Logistic Regression",
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0
+    },
+    {
+      "algorithm": "Naive Bayes",
+      "accuracy": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0
+    }
+  ],
+  "selected_model": "Logistic Regression",
+  "confusion_matrix": {
+    "labels": [
+      "ADMIN",
+      "CANTEEN",
+      "FACULTY",
+      "HOSTEL",
+      "INFRASTRUCTURE",
+      "LABS",
+      "OTHER"
+    ],
+    "matrix": [
+      [
+        17,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        17,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        17,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        17,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        18,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        17,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        17
+      ]
+    ]
+  }
+}
